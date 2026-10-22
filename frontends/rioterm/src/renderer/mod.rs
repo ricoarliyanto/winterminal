@@ -1,0 +1,880 @@
+pub mod assistant;
+pub mod command_palette;
+pub mod confirm_quit;
+pub mod custom_cursor;
+pub mod helpers;
+pub mod island;
+pub mod scrollbar;
+pub mod search;
+pub mod trail_cursor;
+pub mod utils;
+
+use win_backend::event::TerminalDamage;
+use taffy::NodeId;
+
+use crate::context::renderable::{PendingUpdate, RenderableContent};
+use crate::context::ContextManager;
+use crate::crosswords::style::{Style as CellStyle, StyleFlags};
+use win_backend::config::colors::term::TermColors;
+use win_backend::config::colors::{
+    term::{List, DIM_FACTOR},
+    AnsiColor, ColorArray, Colors, NamedColor,
+};
+use win_backend::config::navigation::Navigation;
+use win_backend::config::Config;
+use win_backend::event::EventProxy;
+use win_backend::sugarloaf::Sugarloaf;
+
+/// The window-bg clear alpha that flows into sugarloaf's
+/// `set_background_color`. Stored on the renderer and re-applied on
+/// every `effective_bg` write so OSC 11 changes don't reset
+/// transparency to 1.0.
+///
+/// - Glass blur styles force `0.0` so the macOS-26 `NSGlassEffectView`
+///   under the metal layer is what shows through.
+/// - Otherwise it's the configured `window.opacity`, clamped to
+///   `[0, 1]`.
+#[inline]
+fn window_bg_alpha(config: &Config) -> f32 {
+    if config.window.blur.is_glass() {
+        0.0
+    } else {
+        config.window.opacity.clamp(0.0, 1.0)
+    }
+}
+
+pub struct Renderer {
+    is_vi_mode_enabled: bool,
+    is_game_mode_enabled: bool,
+    pub is_window_focused: bool,
+    draw_bold_text_with_light_colors: bool,
+    use_drawable_chars: bool,
+    pub named_colors: Colors,
+    pub colors: List,
+    pub navigation: Navigation,
+    pub margin: win_backend::config::layout::Margin,
+    pub island: Option<island::Island>,
+    pub command_palette: command_palette::CommandPalette,
+    unfocused_split_opacity: f32,
+    unfocused_split_fill: Option<ColorArray>,
+    last_active: Option<NodeId>,
+    /// Last `win_backend::sugarloaf::Color` we applied to sugarloaf's window clear via
+    /// `set_background_color`. Lets the per-frame "derive bg from
+    /// active panel's OSC state" loop avoid redundant resyncs.
+    last_window_bg: Option<win_backend::sugarloaf::Color>,
+    pub config_has_blinking_enabled: bool,
+    pub config_blinking_interval: u64,
+    pub(crate) ignore_selection_fg_color: bool,
+    pub search: search::SearchOverlay,
+    pub assistant: assistant::AssistantOverlay,
+    pub confirm_quit: confirm_quit::ConfirmQuit,
+    pub scrollbar: scrollbar::Scrollbar,
+    #[allow(unused)]
+    pub option_as_alt: String,
+    #[allow(unused)]
+    pub macos_use_unified_titlebar: bool,
+    // Dynamic background keep track of the original bg color and
+    // the same r,g,b with the mutated alpha channel.
+    pub dynamic_background: ([f32; 4], win_backend::sugarloaf::Color, bool),
+    /// `window.opacity-cells` — apply window opacity to cells with an
+    /// SGR-set background too. Off by default. `cell_bg_alpha` is the
+    /// precomputed `(window.opacity * 255) as u8` to avoid a multiply
+    /// per cell.
+    pub opacity_cells: bool,
+    pub cell_bg_alpha: u8,
+    /// Target alpha for the window-bg clear (`0..=1`). 0 in glass
+    /// mode, otherwise `window.opacity`. Re-applied to `effective_bg`
+    /// every frame so OSC 11 doesn't undo the user's transparency.
+    pub window_bg_alpha: f32,
+    pub custom_mouse_cursor: bool,
+    pub trail_cursor_enabled: bool,
+    pub trail_cursor: trail_cursor::TrailCursor,
+}
+
+impl Renderer {
+    pub fn new(config: &Config) -> Renderer {
+        let colors = List::from(&config.colors);
+        let named_colors = config.colors;
+
+        let mut dynamic_background =
+            (named_colors.background.0, named_colors.background.1, false);
+        // Window-bg target alpha. Cached here at init and re-applied
+        // to every OSC-11-driven `effective_bg` refresh in
+        // `Renderer::run` so a runtime bg change doesn't reset
+        // transparency to 1.0. Glass styles force alpha = 0 so the
+        // NSGlassEffectView underneath the metal layer can provide
+        // the actual translucent bg — `window_bg_alpha` returns 0 in
+        // that case, so the glass and `opacity < 1` paths share one
+        // assignment.
+        let target_bg_alpha = window_bg_alpha(config);
+        if config.window.blur.is_glass() || config.window.opacity < 1. {
+            dynamic_background.1.a = target_bg_alpha as f64;
+            dynamic_background.2 = true;
+        } else if config.window.background_image.is_some() {
+            dynamic_background.1 = win_backend::sugarloaf::Color::TRANSPARENT;
+            dynamic_background.2 = true;
+        }
+
+        let island = if config.navigation.is_enabled() {
+            Some(island::Island::new(
+                named_colors.tabs,
+                named_colors.tabs_active,
+                config.navigation.hide_if_single,
+            ))
+        } else {
+            None
+        };
+
+        Renderer {
+            unfocused_split_opacity: config.navigation.unfocused_split_opacity,
+            unfocused_split_fill: config.navigation.unfocused_split_fill,
+            last_active: None,
+            last_window_bg: None,
+            use_drawable_chars: config.fonts.use_drawable_chars,
+            draw_bold_text_with_light_colors: config.draw_bold_text_with_light_colors,
+            macos_use_unified_titlebar: config.window.macos_use_unified_titlebar,
+            config_blinking_interval: config.cursor.blinking_interval.clamp(350, 1200),
+            option_as_alt: config.option_as_alt.to_lowercase(),
+            is_vi_mode_enabled: false,
+            config_has_blinking_enabled: config.cursor.blinking,
+            is_window_focused: true,
+            ignore_selection_fg_color: config.ignore_selection_fg_color,
+            colors,
+            navigation: config.navigation.clone(),
+            margin: config.margin,
+            island,
+            command_palette: {
+                let mut palette = command_palette::CommandPalette::new();
+                palette.has_adaptive_theme = config.adaptive_colors.is_some();
+                palette
+            },
+            named_colors,
+            dynamic_background,
+            opacity_cells: config.window.opacity_cells,
+            cell_bg_alpha: (config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+            window_bg_alpha: target_bg_alpha,
+            search: search::SearchOverlay::default(),
+            assistant: assistant::AssistantOverlay::default(),
+            confirm_quit: confirm_quit::ConfirmQuit::default(),
+            scrollbar: scrollbar::Scrollbar::new(config.enable_scroll_bar),
+            is_game_mode_enabled: config.renderer.strategy.is_game(),
+            custom_mouse_cursor: config.effects.custom_mouse_cursor,
+            trail_cursor_enabled: config.effects.trail_cursor,
+            trail_cursor: trail_cursor::TrailCursor::new(),
+        }
+    }
+
+    #[inline]
+    pub fn use_drawable_chars(&self) -> bool {
+        self.use_drawable_chars
+    }
+
+    #[inline]
+    pub fn set_active_search(&mut self, active_search: Option<String>) {
+        self.search.set_active_search(active_search);
+    }
+
+    #[inline]
+    pub(crate) fn compute_color(
+        &self,
+        color: &AnsiColor,
+        flags: StyleFlags,
+        term_colors: &TermColors,
+    ) -> ColorArray {
+        let dim = flags.contains(StyleFlags::DIM);
+        let bold = flags.contains(StyleFlags::BOLD);
+        match color {
+            AnsiColor::Named(ansi) => {
+                match (self.draw_bold_text_with_light_colors, dim, bold) {
+                    // If no bright foreground is set, treat it like the BOLD flag doesn't exist.
+                    (_, true, true)
+                        if ansi == &NamedColor::Foreground
+                            && self.named_colors.light_foreground.is_none() =>
+                    {
+                        self.color(NamedColor::DimForeground as usize, term_colors)
+                    }
+                    // Draw bold text in bright colors *and* contains bold flag.
+                    (true, false, true) => {
+                        self.color(ansi.to_light() as usize, term_colors)
+                    }
+                    // Cell is marked as dim and not bold.
+                    (_, true, false) | (false, true, true) => {
+                        self.color(ansi.to_dim() as usize, term_colors)
+                    }
+                    // None of the above, keep original color..
+                    _ => self.color(*ansi as usize, term_colors),
+                }
+            }
+            AnsiColor::Spec(rgb) => {
+                if !dim {
+                    rgb.to_arr()
+                } else {
+                    rgb.to_arr_with_dim()
+                }
+            }
+            AnsiColor::Indexed(index) => {
+                let index = match (dim, index) {
+                    (true, 8..=15) => *index as usize - 8,
+                    (true, 0..=7) => NamedColor::DimBlack as usize + *index as usize,
+                    _ => *index as usize,
+                };
+
+                self.color(index, term_colors)
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn compute_bg_color(
+        &self,
+        cell_style: &CellStyle,
+        term_colors: &TermColors,
+    ) -> ColorArray {
+        let dim = cell_style.flags.contains(StyleFlags::DIM);
+        let bold = cell_style.flags.contains(StyleFlags::BOLD);
+        match cell_style.bg {
+            AnsiColor::Named(ansi) => self.color(ansi as usize, term_colors),
+            AnsiColor::Spec(rgb) => {
+                if dim {
+                    (&(rgb * DIM_FACTOR)).into()
+                } else {
+                    (&rgb).into()
+                }
+            }
+            AnsiColor::Indexed(idx) => {
+                let idx = match (self.draw_bold_text_with_light_colors, dim, bold, idx) {
+                    (true, false, true, 0..=7) => idx as usize + 8,
+                    (false, true, false, 8..=15) => idx as usize - 8,
+                    (false, true, false, 0..=7) => {
+                        NamedColor::DimBlack as usize + idx as usize
+                    }
+                    _ => idx as usize,
+                };
+
+                self.color(idx, term_colors)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_vi_mode(&mut self, is_vi_mode_enabled: bool) {
+        self.is_vi_mode_enabled = is_vi_mode_enabled;
+    }
+
+    // Get the RGB value for a color index.
+    #[inline]
+    pub fn color(&self, color: usize, term_colors: &TermColors) -> ColorArray {
+        term_colors[color].unwrap_or(self.colors[color])
+    }
+
+    #[inline]
+    pub fn run(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+        context_manager: &mut ContextManager<EventProxy>,
+    ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
+        let mut any_panel_dirty = false;
+        let grid = context_manager.current_grid_mut();
+        let active_key = grid.current;
+        let grid_scaled_margin = grid.get_scaled_margin();
+        let mut has_active_changed = false;
+        if self.last_active != Some(active_key) {
+            has_active_changed = true;
+            self.last_active = Some(active_key);
+        }
+
+        for (_key, grid_context) in grid.contexts_mut().iter_mut() {
+            let panel_rect = grid_context.layout_rect;
+            let context = grid_context.context_mut();
+
+            let mut has_ime = false;
+            if let Some(preedit) = context.ime.preedit() {
+                if let Some(content) = preedit.text.chars().next() {
+                    context.renderable_content.cursor.content = content;
+                    context.renderable_content.cursor.is_ime_enabled = true;
+                    has_ime = true;
+                }
+            }
+
+            if !has_ime {
+                context.renderable_content.cursor.is_ime_enabled = false;
+                context.renderable_content.cursor.content =
+                    context.renderable_content.cursor.content_ref;
+            }
+
+            let force_full_damage = has_active_changed || self.is_game_mode_enabled;
+
+            let is_dirty = context.renderable_content.pending_update.is_dirty();
+
+            // Check if we need to render
+            if !is_dirty && !force_full_damage {
+                // No updates pending, skip rendering
+                continue;
+            }
+            any_panel_dirty = true;
+
+            // UI-side damage (scroll, selection, resize, etc.)
+            let ui_terminal_damage = context
+                .renderable_content
+                .pending_update
+                .take_terminal_damage();
+            context.renderable_content.pending_update.reset();
+
+            {
+                let mut terminal = context.terminal.lock();
+
+                // Clear in-flight flag so PTY thread can notify again
+                terminal.damage_event_in_flight = false;
+
+                let pty_damage = terminal.peek_damage_event();
+
+                let damage = if force_full_damage {
+                    TerminalDamage::Full
+                } else {
+                    match (ui_terminal_damage, pty_damage) {
+                        (Some(ui), Some(pty)) => {
+                            PendingUpdate::merge_terminal_damages(ui, pty)
+                        }
+                        (Some(d), None) | (None, Some(d)) => d,
+                        // UI-only damage (overlay hover, command-palette
+                        // input, etc.): cells didn't change, but the
+                        // panel still has to go through the render path
+                        // so UI overlays paint on top of a fresh frame.
+                        // Noop propagates to `RowsToRebuild::None` in
+                        // `screen::render`'s emit loop — grid keeps its
+                        // resident CPU bg/fg buffers, zero row work.
+                        (None, None) => TerminalDamage::Noop,
+                    }
+                };
+
+                terminal.reset_damage();
+
+                let snapshot_cols = terminal.columns();
+                terminal.snapshot_visible(
+                    &damage,
+                    snapshot_cols,
+                    &mut context.renderable_content.visible_rows,
+                    &mut context.renderable_content.style_table,
+                    &mut context.renderable_content.extras,
+                );
+                context.renderable_content.term_colors = terminal.colors;
+                context.renderable_content.display_offset = terminal.display_offset();
+                context.renderable_content.columns = snapshot_cols;
+                context.renderable_content.screen_lines = terminal.screen_lines();
+                context.renderable_content.history_size = terminal.history_size();
+                context.renderable_content.blinking_cursor = terminal.blinking_cursor;
+                context.renderable_content.cursor.state = terminal.cursor();
+                if terminal.graphics.kitty_graphics_dirty {
+                    context.renderable_content.kitty_virtual_placements =
+                        terminal.graphics.kitty_virtual_placements.clone();
+                    context.renderable_content.kitty_images =
+                        terminal.graphics.kitty_images.clone();
+                    context.renderable_content.kitty_placements = {
+                        let mut placements: Vec<_> = terminal
+                            .graphics
+                            .kitty_placements
+                            .values()
+                            .filter(|p| {
+                                terminal.graphics.kitty_images.contains_key(&p.image_id)
+                            })
+                            .cloned()
+                            .collect();
+                        placements.sort_by_key(|p| p.z_index);
+                        placements
+                    };
+                    context.renderable_content.kitty_graphics_dirty = true;
+                    terminal.graphics.kitty_graphics_dirty = false;
+                } else {
+                    context.renderable_content.kitty_graphics_dirty = false;
+                }
+                context.renderable_content.frame_damage = damage;
+                drop(terminal);
+            }
+
+            // Recalculate image overlay positions every frame when placements
+            // exist. Positions depend on display_offset and history_size which
+            // change on scroll and text output (like approach).
+            let rc = &context.renderable_content;
+            let has_overlays = !rc.kitty_placements.is_empty();
+            let has_virtual = !rc.kitty_virtual_placements.is_empty();
+            if has_overlays || has_virtual {
+                let layout = context.dimension;
+                // Canonical integer cell stride — line_height already
+                // baked into `cell.cell_height`. Same value the GPU
+                // grid uniform paints with.
+                let cell_width = layout.cell.cell_width as f32;
+                let cell_height = layout.cell.cell_height as f32;
+                let origin_x = panel_rect[0] + grid_scaled_margin.left;
+                let origin_y = panel_rect[1] + grid_scaled_margin.top;
+
+                let overlays = sugarloaf
+                    .image_overlays
+                    .entry(context.rich_text_id)
+                    .or_default();
+                overlays.clear();
+
+                if has_overlays {
+                    let history_size = rc.history_size as i64;
+                    let display_offset = rc.display_offset as i64;
+                    let screen_lines = rc.screen_lines as i64;
+
+                    for p in &rc.kitty_placements {
+                        let screen_row = p.dest_row - (history_size - display_offset);
+                        let image_bottom_row = screen_row + p.rows as i64;
+                        // Cull only if fully off-screen (like )
+                        if image_bottom_row <= 0 || screen_row >= screen_lines {
+                            continue;
+                        }
+                        overlays.push(win_backend::sugarloaf::GraphicOverlay {
+                            image_id: p.image_id,
+                            // kitty X=/Y= offset, supports sub-cell positioning
+                            x: origin_x
+                                + p.dest_col as f32 * cell_width
+                                + p.cell_x_offset as f32,
+                            y: origin_y
+                                + screen_row as f32 * cell_height
+                                + p.cell_y_offset as f32,
+                            width: p.pixel_width as f32,
+                            height: p.pixel_height as f32,
+                            z_index: p.z_index,
+                            source_rect:
+                                win_backend::sugarloaf::GraphicOverlay::FULL_SOURCE_RECT,
+                        });
+                    }
+                }
+
+                if has_virtual {
+                    Self::push_virtual_placeholder_overlays(
+                        overlays,
+                        rc,
+                        origin_x,
+                        origin_y,
+                        cell_width,
+                        cell_height,
+                    );
+                }
+            } else if rc.kitty_graphics_dirty {
+                // Placements were removed — clear overlays
+                sugarloaf.clear_image_overlays_for(context.rich_text_id);
+            }
+
+            context.renderable_content.has_blinking_enabled =
+                context.renderable_content.blinking_cursor;
+
+            if context.renderable_content.blinking_cursor {
+                let has_selection = context.renderable_content.selection_range.is_some();
+                if !has_selection {
+                    let mut should_blink = self.is_window_focused;
+                    if let Some(last_typing_time) = context.renderable_content.last_typing
+                    {
+                        if last_typing_time.elapsed() < std::time::Duration::from_secs(1)
+                        {
+                            should_blink = false;
+                        }
+                    }
+
+                    if should_blink {
+                        let now = std::time::Instant::now();
+                        let should_toggle = if let Some(last_blink) =
+                            context.renderable_content.last_blink_toggle
+                        {
+                            now.duration_since(last_blink).as_millis()
+                                >= self.config_blinking_interval as u128
+                        } else {
+                            // First time: start with cursor visible and set initial timing
+                            context.renderable_content.is_blinking_cursor_visible = true;
+                            context.renderable_content.last_blink_toggle = Some(now);
+                            false // Don't toggle on first frame
+                        };
+
+                        if should_toggle {
+                            context.renderable_content.is_blinking_cursor_visible =
+                                !context.renderable_content.is_blinking_cursor_visible;
+                            context.renderable_content.last_blink_toggle = Some(now);
+                        }
+                    } else {
+                        // When not blinking (e.g., during typing), ensure cursor is visible
+                        context.renderable_content.is_blinking_cursor_visible = true;
+                        // Reset blink timing when not blinking so it starts fresh when blinking resumes
+                        context.renderable_content.last_blink_toggle = None;
+                    }
+                } else {
+                    // When there's a selection, keep cursor visible and reset blink timing
+                    context.renderable_content.is_blinking_cursor_visible = true;
+                    context.renderable_content.last_blink_toggle = None;
+                }
+            }
+        }
+
+        if self.scrollbar.is_enabled() {
+            self.scrollbar.clear_panel_states();
+            for grid_context in grid.contexts_mut().values() {
+                let panel_rect = grid_context.layout_rect;
+                let ctx = grid_context.context();
+                let rc = &ctx.renderable_content;
+                self.scrollbar
+                    .push_panel_state(scrollbar::PanelScrollState {
+                        rich_text_id: ctx.rich_text_id,
+                        panel_rect,
+                        display_offset: rc.display_offset,
+                        history_size: rc.history_size,
+                        screen_lines: rc.screen_lines,
+                    });
+            }
+        }
+
+        let window_size = sugarloaf.window_size();
+        let scale_factor = sugarloaf.scale_factor();
+
+        // Dim overlay for unfocused splits. Drawn after the split content is
+        // built so it composites on top. The tint comes from
+        // `unfocused_split_fill` (falling back to the terminal background)
+        // and its strength is `1.0 - unfocused_split_opacity`. Skipped
+        // entirely when the feature is disabled.
+        if self.unfocused_split_opacity < 1.0 {
+            let tint = self
+                .unfocused_split_fill
+                .unwrap_or(self.dynamic_background.0);
+            let dim_color = [
+                tint[0],
+                tint[1],
+                tint[2],
+                1.0 - self.unfocused_split_opacity,
+            ];
+            for (key, grid_context) in grid.contexts_mut().iter() {
+                if &active_key == key {
+                    continue;
+                }
+                // Match the grid renderer's actual paint region —
+                // `.round()`ed integer-pixel origin +
+                // `cols * round(cell_w)` × `rows * round(cell_h)`
+                // content size (same math as `GridUniforms.grid_padding`
+                // / `cell_size` in `screen/mod.rs:~3717`). Using raw
+                // `layout_rect` leaves a sub-pixel un-dimmed fringe at
+                // the right/bottom edges of inactive splits because
+                // taffy allocates fractional sizes while the grid
+                // snaps to whole cells.
+                let dim = grid_context.val.dimension;
+                let cell_w = dim.cell.cell_width as f32;
+                let cell_h = dim.cell.cell_height as f32;
+                let cols = dim.columns.max(1) as f32;
+                let rows = dim.lines.max(1) as f32;
+                let panel_left =
+                    (grid_context.layout_rect[0] + grid_scaled_margin.left).round();
+                let panel_top =
+                    (grid_context.layout_rect[1] + grid_scaled_margin.top).round();
+                let x = panel_left / scale_factor;
+                let y = panel_top / scale_factor;
+                let w = (cols * cell_w) / scale_factor;
+                let h = (rows * cell_h) / scale_factor;
+                sugarloaf.rect(None, x, y, w, h, dim_color, 0.0, 3);
+            }
+        }
+
+        if let Some(island) = &mut self.island {
+            let island_bg = self
+                .last_window_bg
+                .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32])
+                .unwrap_or(self.named_colors.background.0);
+            island.render(
+                sugarloaf,
+                (window_size.width, window_size.height, scale_factor),
+                context_manager,
+                island_bg,
+            );
+        }
+
+        self.assistant.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.search.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.command_palette.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.confirm_quit.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        // Render scrollbars for each panel
+        let grid_scaled_margin_sb = context_manager.get_current_grid_scaled_margin();
+        let grid_margin_sb = (grid_scaled_margin_sb.left, grid_scaled_margin_sb.top);
+        let panel_count = self.scrollbar.panel_states().len();
+        for i in 0..panel_count {
+            let state = self.scrollbar.panel_states()[i];
+            self.scrollbar.render(
+                sugarloaf,
+                state.panel_rect,
+                scale_factor,
+                state.display_offset,
+                state.history_size,
+                state.screen_lines,
+                state.rich_text_id,
+                grid_margin_sb,
+            );
+        }
+
+        // Render panel borders (on top of terminal content). Borders
+        // are flat rects today — the previous `Object` enum
+        // (Rect / Quad / RichText) was only ever populated with the
+        // Rect variant, so the dispatch is direct now.
+        let grid_scaled_margin = context_manager.get_current_grid_scaled_margin();
+        for rect in context_manager.get_panel_borders() {
+            let x = (rect.x + grid_scaled_margin.left) / scale_factor;
+            let y = (rect.y + grid_scaled_margin.top) / scale_factor;
+            let width = rect.width / scale_factor;
+            let height = rect.height / scale_factor;
+            sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
+        }
+
+        // Derive the window bg color from the currently-active panel's
+        // OSC 11 state (sticky on `renderable_content.background`) on
+        // every frame, not just the frame where OSC arrived. Without
+        // this, switching from a panel that ran OSC 11 to one that
+        // didn't keeps sugarloaf's bg stuck at the OSC color — we
+        // want it to follow focus the way does (each surface's
+        // `terminal.colors.background` drives its own window chrome).
+        let current_context = context_manager.current_grid_mut().current_mut();
+        let mut effective_bg = match &current_context.renderable_content.background {
+            Some(crate::context::renderable::BackgroundState::Set(color)) => *color,
+            // Explicit OSC 111 reset OR panel that never ran OSC 11 →
+            // fall back to the config / dynamic_background (honors
+            // window-opacity / background-image).
+            Some(crate::context::renderable::BackgroundState::Reset) | None => {
+                self.dynamic_background.1
+            }
+        };
+        // Re-apply the configured window-bg alpha. Without this, an
+        // OSC 11 sequence that sets a new bg color resets the alpha
+        // to 1.0 and the window goes opaque even when
+        // `window.opacity < 1`. Glass mode forces alpha 0 so the
+        // backdrop view shows through.
+        effective_bg.a = self.window_bg_alpha as f64;
+
+        let window_update = if self.last_window_bg != Some(effective_bg) {
+            sugarloaf.set_background_color(Some(effective_bg));
+            self.last_window_bg = Some(effective_bg);
+            // Native-window chrome (`setBackgroundColor` on macOS,
+            // titlebar color on Windows) follows the same value.
+            Some(crate::context::renderable::WindowUpdate::Background(
+                crate::context::renderable::BackgroundState::Set(effective_bg),
+            ))
+        } else {
+            None
+        };
+
+        (window_update, any_panel_dirty)
+    }
+
+    /// Check if the renderer needs continuous redraw (for animations)
+    #[inline]
+    pub fn needs_redraw(&mut self) -> bool {
+        if self.trail_cursor_enabled && self.trail_cursor.is_animating() {
+            return true;
+        }
+        if self.scrollbar.needs_redraw() {
+            return true;
+        }
+        if let Some(island) = &self.island {
+            island.needs_redraw()
+        } else {
+            false
+        }
+    }
+
+    /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and
+    /// push one `GraphicOverlay` per row-run. Implements four key behaviors
+    /// of the Kitty graphics Unicode-placeholder protocol:
+    ///
+    /// 1. Per-row `kitty_virtual_placeholder` flag check skips rows
+    ///    with no placeholders.
+    /// 2. Continuation rules — a cell with missing diacritics inherits
+    ///    from the previous cell on the row (`canAppend`).
+    /// 3. Run aggregation — consecutive cells with same image / row /
+    ///    sequential column collapse into one Placement
+    ///    (`PlacementIterator.next`, `graphics_unicode.zig:36-99`).
+    /// 4. Per-run source rect with aspect-fit + centering — handles
+    ///    partial visibility (placement scrolled half off-screen) and
+    ///    cells that fall in the centering padding
+    ///    (`renderPlacement`, `graphics_unicode.zig:212-329`).
+    fn push_virtual_placeholder_overlays(
+        overlays: &mut Vec<win_backend::sugarloaf::GraphicOverlay>,
+        rc: &RenderableContent,
+        origin_x: f32,
+        origin_y: f32,
+        cell_width: f32,
+        cell_height: f32,
+    ) {
+        use win_backend::ansi::kitty_virtual::{
+            IncompletePlacement, PlaceholderRun, PLACEHOLDER,
+        };
+
+        // Below text by default for virtual placements — apps that
+        // want them above the glyphs set z-index explicitly via the
+        // graphics protocol.
+        const VIRTUAL_Z_INDEX: i32 = -1;
+
+        for (line_idx, row) in rc.visible_rows.iter().enumerate() {
+            // Per-row dirty flag: skip rows that never had a placeholder
+            // written. O(visible_w · visible_h) → O(rows_with_placeholders).
+            if !row.kitty_virtual_placeholder {
+                continue;
+            }
+
+            // Walk the row left-to-right, building a single in-flight run.
+            // When the next cell can't extend it (different image, col
+            // discontinuity, etc.) we flush the run as one overlay and
+            // start a new one. Mirrors `PlacementIterator.next`.
+            let mut run: Option<(IncompletePlacement, usize)> = None;
+
+            for (col_idx, square) in row.inner.iter().enumerate() {
+                if square.c() != PLACEHOLDER {
+                    if let Some((p, start_col)) = run.take() {
+                        flush_run(
+                            overlays,
+                            rc,
+                            p.complete(),
+                            line_idx,
+                            start_col,
+                            origin_x,
+                            origin_y,
+                            cell_width,
+                            cell_height,
+                            VIRTUAL_Z_INDEX,
+                        );
+                    }
+                    continue;
+                }
+
+                let style = crate::grid_emit::resolve_style(&rc.style_table, *square);
+                let combining: &[char] = square
+                    .extras_id()
+                    .and_then(|eid| rc.extras.get(&eid))
+                    .map(|e| e.zerowidth.as_slice())
+                    .unwrap_or(&[]);
+
+                let mut cell = IncompletePlacement::from_cell(
+                    style.fg,
+                    style.underline_color,
+                    combining,
+                );
+
+                match &mut run {
+                    Some((current, _)) if current.can_append(&cell) => {
+                        current.append();
+                    }
+                    _ => {
+                        if let Some((p, start_col)) = run.take() {
+                            flush_run(
+                                overlays,
+                                rc,
+                                p.complete(),
+                                line_idx,
+                                start_col,
+                                origin_x,
+                                origin_y,
+                                cell_width,
+                                cell_height,
+                                VIRTUAL_Z_INDEX,
+                            );
+                        }
+                        // Default missing row/col on the FIRST cell of a
+                        // run. Without this, a subsequent cell with
+                        // `Some(col)` couldn't sequentially extend a
+                        // run started by a cell with `None`.
+                        if cell.row.is_none() {
+                            cell.row = Some(0);
+                        }
+                        if cell.col.is_none() {
+                            cell.col = Some(0);
+                        }
+                        run = Some((cell, col_idx));
+                    }
+                }
+            }
+
+            if let Some((p, start_col)) = run {
+                flush_run(
+                    overlays,
+                    rc,
+                    p.complete(),
+                    line_idx,
+                    start_col,
+                    origin_x,
+                    origin_y,
+                    cell_width,
+                    cell_height,
+                    VIRTUAL_Z_INDEX,
+                );
+            }
+        }
+
+        /// Look up metadata + image for a completed `PlaceholderRun`,
+        /// compute its on-screen geometry via
+        /// `kitty_virtual::compute_run_geometry`, and push one
+        /// `GraphicOverlay`. Returns silently when the placement isn't
+        /// registered, the image isn't transmitted yet, or the run lies
+        /// entirely in the aspect-fit centering padding.
+        #[allow(clippy::too_many_arguments)]
+        fn flush_run(
+            overlays: &mut Vec<win_backend::sugarloaf::GraphicOverlay>,
+            rc: &RenderableContent,
+            run: PlaceholderRun,
+            screen_line: usize,
+            start_screen_col: usize,
+            origin_x: f32,
+            origin_y: f32,
+            cell_width: f32,
+            cell_height: f32,
+            z_index: i32,
+        ) {
+            let vp = rc
+                .kitty_virtual_placements
+                .get(&(run.image_id, run.placement_id))
+                .or_else(|| rc.kitty_virtual_placements.get(&(run.image_id, 0)));
+            let vp = match vp {
+                Some(v) => v,
+                None => return,
+            };
+            let img = match rc.kitty_images.get(&run.image_id) {
+                Some(i) => i,
+                None => return,
+            };
+
+            let geom = match win_backend::ansi::kitty_virtual::compute_run_geometry(
+                &run,
+                vp.columns,
+                vp.rows,
+                img.data.width as u32,
+                img.data.height as u32,
+                cell_width,
+                cell_height,
+                origin_x,
+                origin_y,
+                screen_line,
+                start_screen_col,
+            ) {
+                Some(g) => g,
+                None => return,
+            };
+
+            overlays.push(win_backend::sugarloaf::GraphicOverlay {
+                image_id: run.image_id,
+                x: geom.x,
+                y: geom.y,
+                width: geom.width,
+                height: geom.height,
+                z_index,
+                source_rect: geom.source_rect,
+            });
+        }
+    }
+}

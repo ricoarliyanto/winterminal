@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+TryExec=win
+Exec=win
+Icon=win
+Terminal=false
+Categories=System;TerminalEmulator;
+
+Name=Win
+GenericName=Terminal
+Comment=A hardware-accelerated GPU terminal emulator powered by WebGPU
+StartupWMClass=Win
+Actions=New;
+
+[Desktop Action New]
+Name=New Terminal
+Exec=win
